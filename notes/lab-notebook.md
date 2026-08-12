@@ -106,3 +106,42 @@ across the classes. A bad strip propagates downstream silently.
 GitHub repo created and pushed (was overdue from Sat Block 5).
 
 
+## Structural pipeline — raw T1 to MNI space
+
+1. BET — remove skull, scalp, neck. `bet T1 T1_brain -f 0.5`
+   -f is the brightness threshold. Ran 0.2, 0.5, 0.8 and compared:
+   0.2 left non-brain attached, 0.8 cut into frontal lobe. Chose 0.5.
+   Must come first: registration would otherwise match skull to skull,
+   and segmentation would classify scalp as a tissue type.
+
+2. FAST — bias correction + segmentation. `fast -B -o out T1_brain`
+   Bias field = smooth intensity gradient from coil non-uniformity, so the
+   same tissue reads brighter in the centre than at the edge. Corrected FIRST,
+   because classification by brightness fails on uncorrected data.
+   Outputs pve_0 CSF, pve_1 grey matter, pve_2 white matter.
+
+3. FLIRT — linear registration to MNI152. `flirt -dof 12 -omat ...`
+   Ran 6 DOF (translation + rotation) and 12 DOF (+ scaling + shear).
+   My brain needed a 22% stretch on one axis, so 6 DOF couldn't fit;
+   12 DOF closed most of the gap.
+
+4. FNIRT — non-linear registration. `fnirt --aff=12dof.mat ...`
+   FLIRT is one transformation for the whole image. FNIRT uses a grid of
+   control points (mine: 21x24x21 at 5mm, ~10,600 points x 3 numbers) so
+   different regions move differently. Needs FLIRT's output as a starting point.
+   Small further improvement at the edges.
+
+5. fsl_anat — the whole thing automated, for comparison.
+   Same steps, different order: it registers first, then extracts the brain
+   using the warp instead of a brightness threshold. Also reorients and crops,
+   which I skipped.
+   My brain volume 1494 cm3 vs its 1335 cm3 — mine kept 12% more, consistent
+   with the residue I found.
+
+**QC finding:** BET left non-brain fragments at the left edge. They persisted
+through FAST (classified as grey matter) and through registration into MNI
+space. Errors propagate; later steps don't clean them up.
+
+**Note:** the affine wasn't something I created — it's in the NIfTI header,
+written by the scanner. I read it. The FLIRT .mat files are different: those
+are transformations I generated, which happen to share the 4x4 format.

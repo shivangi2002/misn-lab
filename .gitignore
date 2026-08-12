@@ -3,3 +3,4 @@ data/
 *.nii.gz
 logs/
 __pycache__/
+derivatives/
