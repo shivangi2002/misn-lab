@@ -145,3 +145,276 @@ space. Errors propagate; later steps don't clean them up.
 **Note:** the affine wasn't something I created — it's in the NIfTI header,
 written by the scanner. I read it. The FLIRT .mat files are different: those
 are transformations I generated, which happen to share the 4x4 format.
+
+## Day 5 — Motion, slice timing, coregistration (13 Aug)
+ 
+Functional preprocessing. Raw BOLD in, MNI-space BOLD out.
+ 
+### Order and why
+1. Motion correction
+2. Slice timing
+3. Coregistration to T1
+4. Concatenate to MNI
+Motion first because slice timing interpolates in TIME and assumes a voxel
+holds the same tissue across volumes — if the head moved, it doesn't.
+Coregistration last because it uses one representative volume from the
+already-cleaned data.
+ 
+### 1. mcflirt — motion correction
+ 
+```
+mcflirt -in <raw bold> -out derivatives/mcflirt/sub-01_bold_mc -plots -report
+```
+ 
+Aligns all 200 volumes to a reference using **6 DOF**. Same head throughout,
+so nothing should be resized or sheared — only translation and rotation. If
+motion correction ever scaled a volume, that would be wrong by construction.
+ 
+**Why motion is so dangerous in fMRI:** the head shifts, so a voxel index now
+sits over different tissue. This happens to EVERY voxel at once, so every
+region's value changes at the same moment. Correlation then reads "these
+regions rise and fall together" as connectivity — when it was a swallow.
+Motion doesn't add random noise; it manufactures shared signal, which is
+exactly what connectivity analysis is built to detect.
+ 
+Worse, it's systematic: children, older adults and patient groups move more.
+So "group X has different connectivity" can just mean "group X moved more."
+ 
+### 2. Framewise displacement
+ 
+`.par` file = 200 rows x 6 columns. Cols 1-3 rotations (radians), 4-6
+translations (mm). FSL convention: rotations first.
+ 
+Read off the plots:
+ 
+| | x | y | z |
+|---|---|---|---|
+| rotations (rad) | 0.004 | 0.002 | **0.008** |
+| translations (mm) | **0.405** | 0.265 | 0.365 |
+ 
+z rotation drifts steadily upward — the head settling into the headrest.
+x rotation wanders with big dips, no net trend. Different patterns, and the
+distinction matters: drift is slow (very low frequency) and gets removed by
+the Day 6 high-pass filter. Wander sits closer to the 0.01-0.1 Hz signal band
+and can't be filtered out without losing signal.
+ 
+Both lines carry jitter at every timepoint — the difference is only that z's
+slow component goes somewhere over the scan and x's doesn't.
+ 
+**Converting rotations to mm:** an angle isn't comparable to a distance, so
+rotations get converted using an assumed 50 mm brain radius (Power et al.
+2012). distance = radians x 50. My worst: 0.008 x 50 = 0.4 mm.
+Methods-section phrasing: *"Rotational parameters were converted to
+millimetres assuming a 50 mm brain radius."*
+ 
+Why a radius is needed at all: rotating the head moves a point at the centre
+almost not at all, and a point at the outer surface a long way. Distance
+travelled depends on radius. 50 mm is a convention (roughly centre-of-brain to
+cortex), same for everyone regardless of actual head size — which is what
+makes values comparable across studies.
+ 
+**FD formula:** for each consecutive pair of volumes, subtract the six
+parameters, convert rotations to mm, take absolute values, sum all six.
+Sum not average — averaging would dilute one big movement across five small
+ones. Direction doesn't matter, only distance, hence absolute values.
+200 volumes -> 199 FD values (volume 1 has no predecessor).
+ 
+```python
+par = np.loadtxt(".../sub-01_bold_mc.par")       # (200, 6)
+diff = np.diff(par, axis=0)                      # (199, 6)
+diff[:, 0:3] = diff[:, 0:3] * 50                 # rotations -> mm
+fd = np.abs(diff).sum(axis=1)                    # (199,)
+```
+ 
+**Result: mean FD 0.087 mm, max 0.213 mm, 0 volumes above 0.5 mm.**
+Very still subject. Nothing to censor, subject not excluded.
+ 
+Common thresholds: 0.5 mm per volume for censoring; mean FD above 0.2-0.3 mm
+for excluding a subject entirely. My worst single volume is under half the
+censoring threshold.
+ 
+**Why 0.5 mm is the threshold:** empirical, not derived. Power et al. looked
+at real data and found correlations became measurably contaminated above it.
+There's no geometric cutoff — ANY motion changes a voxel's tissue mix and so
+changes its value. A voxel sitting on a grey/white boundary shifts its mix at
+any displacement, however small. The question is only whether that change is
+small relative to the ~1% BOLD signal.
+ 
+**Second reference point, needs no literature:** compare motion to voxel size.
+0.405 / 3.59 = 11% of a voxel. Small. This works on any dataset.
+ 
+**Mistake caught:** I compared 0.405 mm (one axis, total drift over 12 min)
+against the 0.5 mm threshold (all six axes, between consecutive volumes).
+Not comparable quantities. The per-axis reading is a screening glance and a
+diagnostic tool — FD is the number with the threshold attached.
+ 
+**When axis matters and when it doesn't:** screening ("is there a problem at
+all?") — take the max across all six, ignore axis. Reporting or diagnosing —
+axis matters, because motion on different axes adds up, and because the
+pattern can point at a cause. Use FD for the former.
+ 
+### 3. slicetimer — slice timing correction
+ 
+```
+slicetimer -i <motion-corrected> -o derivatives/slicetimer/sub-01_bold_st \
+           --tcustom=derivatives/mcflirt/slicetiming.txt -r 3.56
+```
+ 
+**The problem:** 36 slices are captured one at a time across the 3.56 s TR,
+not simultaneously. Slice 1 early in each volume, slice 36 late. That offset
+repeats identically in every volume — so two regions in different slices sit
+on permanently offset clocks. Correlation receives two bare lists of numbers
+with no timestamps attached, pairs them by position, and assumes reading 1
+means the same instant in both. It doesn't.
+ 
+Knowing the timestamps doesn't help: sorting tells you WHEN each slice was
+captured, it doesn't give you the VALUE at the moment you need.
+ 
+**The fix:** each slice has 200 measurements of its own. The reference time
+falls BETWEEN two of them, so interpolate — weight the neighbours by distance
+in time. Same idea as FNIRT's control points, one dimension instead of three.
+FSL uses the middle slice as reference by default, which minimises how far
+anything has to shift.
+ 
+Caveat: interpolation is an estimate, not the truth. It slightly smooths the
+time series, and works best when the signal changes slowly relative to TR.
+BOLD does, which is why this is acceptable.
+ 
+**Interleaved acquisition:** my SliceTiming alternates high/low
+(1.5375, 0, 1.6225, 0.085...) — odd slices first, then even. The scanner does
+this because exciting one slice bleeds energy into its immediate neighbours;
+leaving a gap lets each recover. Consequence: slices 1 and 2 are NEXT TO EACH
+OTHER in space but ~1.5 s apart in time.
+ 
+Used `--tcustom` with the exact JSON values rather than assuming a standard
+interleave pattern. slicetimer wants FRACTIONS OF A TR, so divided each by
+3.56 — all values then fall between 0 and 1, as they must.
+ 
+Output grew 30M -> 99M and became FLOAT32. Not an error: interpolation
+produces distinct fractional values where the input had repeated integers, so
+it compresses far less well. Dimensions unchanged, 64x64x36x200.
+ 
+### 4. epi_reg — BOLD to T1 (BBR)
+ 
+```
+fslroi <slice-timed> derivatives/epi_reg/sub-01_bold_ref.nii.gz 100 1
+epi_reg --epi=<ref> --t1=<whole head> --t1brain=<stripped> --out=...
+```
+ 
+Extracted volume 100 (the middle) because epi_reg needs 3D, not 4D. The middle
+because motion correction aligned everything near there, so it's
+representative rather than an extreme.
+ 
+**Why coregister at all:** BOLD is a blurry 3.59 mm grid. A signal at voxel
+(32,32,18) has no anatomical address without the T1. It's also the route into
+MNI space.
+ 
+**Two things make it harder than Day 4's registrations:**
+ 
+- Different modalities — T1 and BOLD order tissue brightness differently, so
+  subtraction fails as a cost function. Needs mutual information, or BBR.
+- The BOLD is genuinely distorted (see below).
+**BBR — why the white/grey boundary, not the outer edge:**
+ 
+- The outer edge is BLURRY in BOLD. At 3.59 mm a surface voxel contains grey
+  matter + CSF + skull mixed. A smeared band several mm wide, not a step.
+  Align to which part of it?
+- The outer edge only constrains the RIM. The starfish intuition — fix the
+  outline and the inside follows — holds for a RIGID object. BOLD isn't rigid:
+  warped near the sinuses, fine elsewhere. So the rim can fit perfectly while
+  the interior sits wrong, with no warning.
+- The white/grey boundary is sharp in both images (every voxel there is cleanly
+  one tissue or the other), follows every fold so landmarks are spread
+  THROUGHOUT the volume, and survives distortion — BBR asks "does the BOLD have
+  an edge where the T1 says there should be one?", not "are these values
+  equal?"
+Note white matter is the solid INTERIOR mass, not the outer surface — the
+boundary is the interface between white and grey, deep inside, following every
+fold.
+ 
+Log showed: FAST segmentation -> FLIRT pre-alignment -> BBR. Same
+coarse-then-refine pattern as FLIRT -> FNIRT. The boundary comes from FAST,
+so Day 3's segmentation feeds directly into functional coregistration.
+ 
+**Final cost 0.454** (lower is better; under ~0.6 is good).
+Matrix: diagonal all ~1.0, off-diagonal ~0 — no rotation, no scaling, as
+6 DOF requires. Translations only, about -1.1 / 3.7 / -1.7 mm.
+ 
+### 5. Concatenation to MNI
+ 
+```
+convert_xfm -omat bold2mni.mat -concat T1_to_MNI_12dof.mat sub-01_bold2t1.mat
+flirt -in <bold ref> -ref MNI152_T1_2mm_brain -applyxfm -init bold2mni.mat -out ...
+```
+ 
+Two 4x4 matrices multiplied into one. `-concat` reads right to left.
+This is exactly why the affine is 4x4 and not 3x3 (Day 3): square matrices
+compose. `-applyxfm` means don't search, just apply the matrix given.
+ 
+QC: BOLD sits inside the template outline in all three views; ventricles line
+up with the template's ventricles.
+ 
+### Distortion — NOT corrected, a stated limitation
+ 
+EPI (Echo-Planar Imaging) grabs a whole slice in ~100 ms, which is what makes
+200 volumes in 12 minutes possible. It's also why BOLD voxels are coarse
+(3.59 mm) and the image looks blurry next to the T1.
+ 
+The cost: EPI locates each signal by its frequency, which assumes a uniform
+magnetic field.
+ 
+The field isn't uniform. Air and tissue have different MAGNETIC SUSCEPTIBILITY
+(how much a material distorts a field passing through it — an electron-
+structure property, NOT about proton count; the scanner's magnet creates the
+field regardless of what's inside it). At air/tissue boundaries — sinuses, ear
+canals — the field bends. Signals from there return at slightly wrong
+frequencies, so EPI places the tissue in the wrong location: stretching,
+squashing, and signal dropout, along the phase-encoding direction (`j-` in my
+JSON).
+ 
+**The fix is a fieldmap — a separate scan acquired in the same session, which
+measures how the field actually varies. My dataset has none, so this CANNOT be
+corrected.** Not reconstructable after the fact.
+ 
+What to do instead: state it as a limitation, use BBR (more robust to
+distortion than intensity-based methods), and treat orbitofrontal and inferior
+temporal regions as least reliable in this data.
+ 
+### QC finding — the residue, fourth appearance
+ 
+The skull fragments BET left at -f 0.5 have now shown up in: FAST (classified
+as grey matter), the MNI-registered T1, the fsl_anat volume comparison
+(mine 12% larger), and now epi_reg — it ran its own FAST on my stripped brain,
+so the residue produced a spurious boundary fragment outside the brain,
+visible in qc/epi_reg_bbr2.png.
+ 
+Not fixed. The boundary is dominated by thousands of correct points, cost is
+good, alignment is visibly good. Could re-run with fsl_anat's
+T1_biascorr_brain if it ever matters.
+ 
+**The lesson, four times over: errors propagate. Later steps don't clean them
+up, they carry them forward.**
+ 
+### Day 5 outputs
+ 
+```
+derivatives/mcflirt/sub-01_bold_mc.nii.gz    motion-corrected 4D
+derivatives/mcflirt/sub-01_bold_mc.par       6 params x 200 volumes
+derivatives/mcflirt/sub-01_fd.txt            199 FD values
+derivatives/mcflirt/slicetiming.txt          36 timings, fractions of TR
+derivatives/slicetimer/sub-01_bold_st.nii.gz slice-timing corrected
+derivatives/epi_reg/sub-01_bold2t1.mat       BOLD -> T1
+derivatives/epi_reg/bold2mni.mat             BOLD -> MNI (concatenated)
+derivatives/epi_reg/sub-01_bold_mni.nii.gz   BOLD in MNI space
+qc/motion_rot.png, qc/motion_trans.png
+qc/epi_reg_bbr.png, qc/epi_reg_bbr2.png, qc/bold_in_mni.png
+```
+ 
+### Note
+ 
+FSLeyes GUI stopped opening — a WSL X display problem, not FSL. Four instances
+had piled up holding 2.6 GB. `pkill` only caught the wrapper scripts; had to
+`kill -9` by PID. Worked around it with `fsleyes render`, which writes a PNG
+directly without needing a window.
+ 
+
