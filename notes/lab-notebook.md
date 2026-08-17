@@ -418,3 +418,202 @@ had piled up holding 2.6 GB. `pkill` only caught the wrapper scripts; had to
 directly without needing a window.
  
 
+## Day 6 — Denoising + the pipeline script (17 Aug)
+
+The step you CANNOT see fail. Every earlier stage fails visibly — a bad strip
+shows cut brain, a bad registration shows misaligned edges. Denoised BOLD looks
+clean whatever you did to it. Remove too much and the signal is gone, and the
+picture still looks fine. Hence: concepts first, commands second.
+
+### What's actually in a voxel's 200 values
+
+| source | rate | do I have a record of it? |
+|---|---|---|
+| scanner drift | very slow | no |
+| **the signal** | **0.01–0.1 Hz** | — |
+| breathing | ~0.3 Hz | only with a belt — I have none |
+| heartbeat | ~1 Hz | only with a monitor — I have none |
+| residual motion | varies | **yes — the .par file** |
+| random/thermal noise | broadband | no |
+
+Breathing gets in twice: CO2 changes dilate vessels so blood flow rises and
+falls; and the chest expanding physically shifts the head.
+
+**Where 0.01–0.1 Hz comes from.** BOLD doesn't measure firing — it measures
+blood flow RESPONDING to firing. That response takes ~5 s to peak and ~20 s to
+return. One cycle in ~20 s = 0.05 Hz, mid-band. Above 0.1 Hz blood flow can't
+physically keep up; below 0.01 Hz nothing biological is that slow over 12 min.
+
+### 1. Smoothing — for random noise
+
+```
+fslmaths <input> -s 1.27 <output>
+```
+
+Replaces each voxel with a weighted average of itself and its neighbours.
+Random noise is high in one voxel and low in the next, so averaging cancels it.
+Signal is similar between neighbours, so it survives.
+
+**Why nothing earlier caught this.** Motion correction repositions. Slice timing
+shifts in time. Filtering removes frequency bands — but random noise is
+BROADBAND, present at every frequency including mine. Regression needs a record
+of the noise, and random noise has none. All four work on TIME. Smoothing is
+the only step that averages across SPACE.
+
+**sigma vs FWHM.** `-s` takes sigma; papers report FWHM. sigma = FWHM / 2.355.
+So 3 mm FWHM → 1.27. Pass 3 directly and you'd apply 7 mm without any warning.
+
+**Compared 3 mm and 6 mm in FSLeyes.**
+- unsmoothed: visibly grainy, speckle everywhere
+- 6 mm: speckle gone, but internal structure washed into an even grey blob
+- 3 mm: speckle reduced, midline and ventricles still visible
+
+**Chose 3 mm** — roughly one voxel width at 3.59 mm.
+
+**The cost, which is worse than "less precision":** smoothing is BLIND to
+regions. Near a boundary it mixes voxels from the neighbouring region in. So it
+can MANUFACTURE connectivity between adjacent regions, the same way motion
+does. And since Day 7 averages within regions anyway — which already cancels
+noise — heavy smoothing buys little.
+
+### 2. High-pass filtering — for noise OUTSIDE the band
+
+```
+fslmaths <input> -bptf 14 -1 <output>
+```
+
+Keep 0.01–0.1 Hz, discard the rest. Works on RATE OF WOBBLE alone.
+
+**Deriving the 14:** 0.01 Hz → 1/0.01 = 100 s per cycle → 100/3.56 = 28
+volumes → FSL wants half the period → sigma 14. Depends on MY TR; a dataset
+with TR 2.0 would need 25.
+
+**`-1` = no low-pass, and the reason matters.** Breathing at ~0.3 Hz is one
+cycle every 3 s, but my TR is 3.56 s — I sample slower than the thing cycles.
+It was never captured as breathing. It doesn't vanish either: an undersampled
+fast signal gets misread as a slower one (ALIASING), folded into my signal band
+where it looks like brain activity. No filter can separate it. Which is part of
+why nuisance regression matters — WM and CSF carry traces of it.
+
+**Where filtering fails generally:** noise INSIDE the band. My wandering
+x-rotation sat around 0.03 Hz, between 0.01 and 0.1. A filter would have to
+delete 0.03 Hz, and my signal is there too. It cannot tell "this 0.03 Hz wobble
+is motion" from "this 0.03 Hz wobble is brain."
+
+### 3. Nuisance regression — for noise I have a RECORD of
+
+**The difference in one line:** filtering gets only the voxel's time series.
+Regression gets the voxel's time series AND a separate record of the noise over
+time. That extra record is everything — it works regardless of frequency.
+
+**Mechanism.** Head moves → the voxel's box holds a different tissue mix → its
+value changes. So the two series track each other:
+```
+voxel:   340, 350, 345, 355, 342
+motion:  0.0, 0.2, 0.1, 0.3, 0.05
+```
+Find the relationship, predict the noise-caused part, subtract it. What remains
+is what the noise couldn't explain.
+
+**Building the WM and CSF regressors.** Motion's record already existed —
+mcflirt had to compute those numbers to do its job, and `-plots` just wrote
+them down. WM and CSF didn't. `fast` gave a SPATIAL map of where they are; I
+needed 200 numbers over TIME.
+
+```
+fslmaths pve_2 -thr 0.9 -bin  → wm_mask      # strict: want PURE tissue
+fslmaths pve_0 -thr 0.9 -bin  → csf_mask     # any partial-volume GM defeats
+                                             # the point of a noise reference
+convert_xfm -omat t1_to_bold.mat -inverse bold2t1.mat
+flirt ... -interp nearestneighbour            # masks are in T1 space
+fslmeants -i <filtered> -m <mask> -o ts.txt   # → 200 numbers
+```
+
+- **Inverting**, because epi_reg gave BOLD→T1 and I need T1→BOLD. Cheaper to
+  move a small mask than to resample 200 BOLD volumes up to 1 mm.
+- **nearestneighbour**, because default interpolation would produce 0.4 and 0.7
+  and a mask must stay binary.
+- Checked the masks survived: WM 8,753 voxels, CSF 3,178. A strict threshold
+  plus resampling to coarser voxels can leave a mask nearly empty.
+
+**8 regressors: 6 motion parameters + WM + CSF.**
+
+**The cost, and it's real.** Regression removes ANYTHING that tracks the
+regressor — including neural activity that happens to rise and fall at the same
+times the head moved. Each regressor eats a bit more data whether or not it's
+noise. 6 motion parameters is fine; 36 starts costing signal. That's
+OVERFITTING, and it's invisible.
+
+### 4. Global signal regression — ran both, using neither
+
+The global signal is the average of EVERY voxel at each timepoint.
+
+**For:** one regressor catches all global noise at once, including sources I
+have no record of (breathing, drift, motion) — valuable precisely because I
+have no physiological recordings.
+
+**Against:** the average includes grey matter, so it contains real neural
+signal. And arithmetically, subtracting the mean from every region forces some
+regions above it and some below — so **GSR mathematically manufactures negative
+correlations whether or not the brain has them.** Papers reporting
+"anticorrelated networks" after GSR have been challenged on exactly this.
+
+Neither side has won. Some labs always, some never, some report both.
+
+**Ran both versions on sub-01** (`confounds_GSR.txt` vs `confounds_noGSR.txt`).
+**The script uses noGSR** — the safer default, and my subject's motion is
+minimal so GSR's main benefit barely applies here anyway.
+
+### ⭐ preprocess_subject.sh
+
+One command, subject ID in, denoised data out.
+
+**The ordering constraints, which are the real content:**
+
+| | why |
+|---|---|
+| bet → fast | fast needs the stripped brain |
+| fast → epi_reg | BBR needs pve_2's edge as its target |
+| mcflirt → slicetimer | slice timing interpolates in TIME and assumes a voxel holds the same tissue across volumes. If the head moved, it doesn't. |
+| slicetimer → epi_reg | epi_reg takes one volume, and it should come from cleaned data |
+| epi_reg → regressors | the mask transform is the INVERSE of epi_reg's matrix |
+| everything → fsl_glm | regression uses mcflirt's .par |
+
+**Bash things learned:**
+- `set -e` — stop on first failure. Without it a failed bet lets everything
+  after run on a file that doesn't exist.
+- `$1` — the first argument. `SUB=$1`, then `$SUB` everywhere.
+- `${SUB}_T1w` — braces say where the variable name ends. Without them bash
+  looks for a variable called `SUB_T1w`, which doesn't exist. Silent failure.
+- `$( ... )` — capture a command's output into a variable. Used to read TR from
+  the JSON rather than hardcoding 3.56.
+- `chmod +x` — without it bash refuses to run the file.
+- `./script.sh` — the `./` because it's not on PATH.
+
+**Three failures, and what each taught:**
+1. `ModuleNotFoundError: numpy` — the script called system `python3`, but numpy
+   lives in the venv. Fixed with `PY=$HOME/misn-env/bin/python`. `set -e`
+   stopped it cleanly instead of cascading.
+2. **nano reflowed the pasted script**, joining commands into paragraphs and
+   silently eating `$PY`. Long scripts should not be pasted into nano.
+3. A `cat > file << 'EOF'` paste got truncated — too long for the terminal.
+   Wrote the file elsewhere and copied it in.
+
+**Verification: the script reproduced the BBR cost of 0.454114 exactly,
+matching my manual run.**
+
+### Known limitations in the script
+- `fslroi ... 100 1` hardcodes volume 100 — assumes ≥100 volumes
+- `-bptf 14` hardcoded, though it derives from TR. A different TR needs a
+  different value.
+- No FNIRT — small gain for 10–30 min per subject. Affine is the defensible
+  default at this stage.
+- No distortion correction — no fieldmap exists in this dataset.
+
+### Day 6 outputs
+```
+scripts/preprocess_subject.sh            ⭐ the deliverable
+derivatives/denoise/sub-01_clean.nii.gz  105M, fully preprocessed
+qc/smoothing_none.png, _3mm.png, _6mm.png
+qc/smooth_3mm_fsleyes.png, smooth_6mm_fsleyes.png
+```
